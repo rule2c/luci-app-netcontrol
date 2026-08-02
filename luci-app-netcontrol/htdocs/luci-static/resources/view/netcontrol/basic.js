@@ -1,0 +1,429 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Copyright (C) 2026 rule2c <rule2c@gmail.com>
+ */
+'use strict';
+'require view';
+'require fs';
+'require uci';
+'require form';
+'require poll';
+'require dom';
+'require network';
+
+// ── 服务状态 ──────────────────────────────────────────────────────────────────
+
+function checkNetControlProcess() {
+    // 用自定义的 service_state 命令（综合“总开关 + 守护进程”），
+    // 不用 `status`——后者在部分版本会被 rc.common 的内置 status 覆盖而只按 procd 报运行中。
+    // state 取值：running（开关开且进程存活）/ disabled（总开关关闭）/ stopped（开关开但进程异常退出）
+    return fs.exec('/etc/init.d/netcontrol', ['service_state']).then(function(res) {
+        var out = (res.stdout || '').trim();
+        return { state: (out === 'running' || out === 'disabled' || out === 'stopped') ? out : 'error' };
+    }).catch(function() {
+        return { state: 'error' };
+    });
+}
+
+// 返回 DOM 节点而不是 HTML 字符串：调用方直接 dom.content() 挂上去，
+// 不必走 innerHTML，也就不存在把文本当标记解析的风险。
+var SERVICE_STATES = {
+    running:  { mark: '✓', color: '#3d8b40', label: 'RUNNING' },
+    disabled: { mark: '○', color: '#888888', label: 'DISABLED' },
+    stopped:  { mark: '✗', color: '#d9534f', label: 'NOT RUNNING' }
+};
+
+function renderServiceStatus(state) {
+    var s = SERVICE_STATES[state] || SERVICE_STATES.stopped;
+    return E('span', { 'style': 'color:' + s.color + ';font-style:italic' }, [
+        s.mark + ' ',
+        E('strong', {}, [_('NetControl Service'), ' ', _(s.label)])
+    ]);
+}
+
+// ── 设备状态表 ────────────────────────────────────────────────────────────────
+
+function renderStatusTable(content) {
+    if (!content || !content.trim()) {
+        return E('p', { 'class': 'alert-message' }, _('No device data available.'));
+    }
+
+    var rows = [E('tr', { 'class': 'tr table-titles' }, [
+        E('th', { 'class': 'th' }, _('Device')),
+        E('th', { 'class': 'th' }, _('Status')),
+        E('th', { 'class': 'th' }, _('Time Used')),
+        E('th', { 'class': 'th' }, _('Time Limit')),
+        E('th', { 'class': 'th' }, _('Action'))
+    ])];
+
+    var visibleCount = 0;
+    var seenTargets = {};
+    content.trim().split('\n').forEach(function(line) {
+        var p = line.split('\t');
+        if (p.length < 7) return;
+
+        var target   = p[0];
+        var blocked  = p[1] === '1';
+        var usedMin  = p[2];
+        var maxMin   = p[3];
+        var comment  = p[4];
+        var enabled  = p[5] === '1';
+        var timeMode = p[6];
+
+        if (!target || !enabled) return;
+        if (seenTargets[target]) return;
+        seenTargets[target] = true;
+        visibleCount++;
+
+        var label = comment ? (comment + ' (' + target + ')') : target;
+
+        var statusEl = blocked
+            ? E('span', { 'style': 'color:#d9534f;font-weight:bold' }, '● ' + _('Blocked'))
+            : E('span', { 'style': 'color:#5cb85c;font-weight:bold' }, '● ' + _('Allowed'));
+
+        // 以后端是否输出了实际数值为准，而不是只看 timeMode：后端对没有时长维度的
+        // 规则写 "-"，只看模式会渲染成“- 分钟”并多出一个无意义的重置按钮。
+        var hasDuration = (timeMode === 'duration' || timeMode === 'combined') && usedMin !== '-';
+        var usedEl  = hasDuration ? (usedMin + ' ' + _('min')) : '-';
+        var limitEl = hasDuration ? (maxMin  + ' ' + _('min')) : '-';
+
+        var actionEl;
+        if (hasDuration) {
+            actionEl = E('button', {
+                'class': 'btn cbi-button cbi-button-action',
+                'style': 'font-size:0.85em;padding:2px 8px',
+                'click': (function(tgt) {
+                    return function(ev) {
+                        var btn = ev.currentTarget;
+                        btn.disabled = true;
+                        btn.textContent = _('Resetting...');
+                        fs.exec_direct('/usr/libexec/netcontrol-call', ['reset_duration', tgt])
+                            .then(function() { btn.textContent = _('Reset'); btn.disabled = false; })
+                            .catch(function() { btn.textContent = _('Reset'); btn.disabled = false; });
+                    };
+                })(target)
+            }, _('Reset'));
+        } else {
+            actionEl = E('span', {}, '-');
+        }
+
+        rows.push(E('tr', { 'class': 'tr' }, [
+            E('td', { 'class': 'td' }, label),
+            E('td', { 'class': 'td' }, statusEl),
+            E('td', { 'class': 'td' }, usedEl),
+            E('td', { 'class': 'td' }, limitEl),
+            E('td', { 'class': 'td' }, actionEl)
+        ]));
+    });
+
+    if (visibleCount === 0) {
+        rows.push(E('tr', { 'class': 'tr' }, [
+            E('td', { 'class': 'td', 'colspan': '5', 'style': 'text-align:center;color:#888' },
+                _('No enabled devices.'))
+        ]));
+    }
+
+    return E('div', { 'class': 'table-wrapper' },
+        E('table', { 'class': 'table cbi-section-table' }, rows)
+    );
+}
+
+// ── 主视图 ────────────────────────────────────────────────────────────────────
+
+return view.extend({
+    load: function() {
+        return Promise.all([
+            uci.load('netcontrol'),
+            network.getHostHints()
+        ]);
+    },
+
+    render: function(data) {
+        var m, s, o;
+        var hints = data[1] || {};
+        var hosts = hints.hosts || hints;
+
+        // ── 服务状态（行内，注入到启用开关之后） ──
+        var serviceStatusView = E('span', {
+            'id': 'service_status',
+            'style': 'margin-left:1em;vertical-align:middle'
+        }, E('span', { 'class': 'spinning' }, ' '));
+
+        function refreshServiceStatus() {
+            return checkNetControlProcess().then(function(res) {
+                dom.content(serviceStatusView, renderServiceStatus(res.state));
+            }).catch(function() {
+                dom.content(serviceStatusView,
+                    E('span', { 'style': 'color:#e0a800' }, '⚠ ' + _('Status check failed')));
+            });
+        }
+        refreshServiceStatus();
+
+        // 15 秒一次而不是 5 秒：这一路要在路由器上真的跑一遍 /etc/init.d/netcontrol
+        // （rc.common + uci + pgrep），比下面读状态文件贵得多，而服务状态几乎不变。
+        // 页面开着时每 5 秒拉起一次进程纯属浪费。
+        poll.add(refreshServiceStatus, 15);
+
+        // ── 设备实时状态表（form 外部独立 DOM） ──
+        var tableWrap = E('div', { 'id': 'tc_status_table' },
+            E('p', { 'style': 'color:#888' }, _('Loading device status...'))
+        );
+
+        function refreshStatus() {
+            return fs.read_direct('/var/lib/netcontrol/device_status.tsv', 'text')
+                .then(function(content) {
+                    dom.content(tableWrap, renderStatusTable(content));
+                })
+                .catch(function() {
+                    dom.content(tableWrap, E('p', { 'style': 'color:#888' },
+                        _('Status unavailable (service may not be running)')));
+                });
+        }
+
+        refreshStatus();
+        poll.add(refreshStatus, 5);
+        poll.start();
+
+        var deviceStatusSection = E('div', { 'class': 'cbi-section' }, [
+            E('h3', {}, _('Device Status')),
+            tableWrap
+        ]);
+
+        // ── Form ──
+        // 不传 title：左侧菜单已有同名入口，顶部无需重复一个标题
+        m = new form.Map('netcontrol');
+
+        // ── 全局设置 ──
+        s = m.section(form.TypedSection, 'netcontrol');
+        s.anonymous = true;
+        s.addremove = false;
+
+        o = s.option(form.Flag, 'enabled', _('Enable Time Control'),
+            _('Master switch. Disabling will immediately stop all control rules and allow all devices to access the internet freely.'));
+        o.rmempty = false;
+        o.default = '0';
+
+        o = s.option(form.ListValue, 'chain', _('Control Intensity'),
+            _('Strong mode also blocks traffic addressed to the router itself, so a blocked device loses access to this web interface as well.'));
+        o.value('forward', _('Ordinary forward control'));
+        o.value('input',   _('Strong input control'));
+        o.default = 'forward';
+        o.rmempty = false;
+
+        // ── 设备规则表 ──
+        s = m.section(form.TableSection, 'device', _('Device Rules'));
+        s.addremove = true;
+        s.anonymous = true;
+        s.sortable  = false;
+
+        // 列宽不能用 o.width：本版 LuCI 的 TableSection 不会把它写到表头 th 上，结果是
+        // 所有列被平均分。列宽统一由下方 colWidths + applyColumnWidths() 以行内样式写入，
+        // 增删列或调整顺序时那个数组必须同步改。
+        o = s.option(form.Value, 'comment', _('Comment'));
+        o.optional = true;
+        o.placeholder = _('Description');
+
+        o = s.option(form.Flag, 'enable', _('Enabled'));
+        o.rmempty = false;
+        o.default = '1';
+
+        o = s.option(form.Value, 'target', _('IP/MAC Address'));
+        o.rmempty = false;
+        // 校验：单个 IPv4 / CIDR / IPv4 范围 / MAC / IPv6(可带前缀)，与后端 parse_target 保持一致
+        o.validate = function(section_id, value) {
+            if (value == null || value === '') return _('IP/MAC address is required');
+            var v = value.trim();
+            var reIpv4      = /^(\d{1,3}\.){3}\d{1,3}$/;
+            var reIpv4Cidr  = /^(\d{1,3}\.){3}\d{1,3}\/\d{1,2}$/;
+            var reIpv4Range = /^(\d{1,3}\.){3}\d{1,3}-(\d{1,3}\.){3}\d{1,3}$/;
+            var reMac       = /^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$/;
+            var reIpv6      = /^([0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}(\/\d{1,3})?$/;
+            function octetsOk(s) {
+                return s.split(/[.\-\/]/).every(function(p) {
+                    return !/^\d+$/.test(p) || parseInt(p, 10) <= 255;
+                });
+            }
+            if (reIpv4.test(v) || reIpv4Range.test(v))
+                return octetsOk(v) ? true : _('Invalid IPv4 address (octet exceeds 255)');
+            if (reIpv4Cidr.test(v)) {
+                if (!octetsOk(v.split('/')[0]))
+                    return _('Invalid IPv4 address (octet exceeds 255)');
+                // 掩码与后端 parse_target 同步校验，否则保存成功但后端静默拒绝、设备永不被拦截
+                return parseInt(v.split('/')[1], 10) <= 32
+                    ? true : _('Invalid IPv4 prefix length (0-32)');
+            }
+            if (reMac.test(v)) return true;
+            if (reIpv6.test(v)) {
+                var p6 = v.split('/');
+                return (p6.length < 2 || parseInt(p6[1], 10) <= 128)
+                    ? true : _('Invalid IPv6 prefix length (0-128)');
+            }
+            return _('Invalid IP/MAC address format');
+        };
+        // 把 DHCP/邻居发现探到的主机铺成下拉候选，标签只放「地址 · 主机名」：把 MAC
+        // 和 IP 互相塞进对方标签会长到 60 字符，在设备表那么窄的列里只会被截断。
+        // 每台主机出两类候选：一条按 MAC（换 IP 也能跟住），每个 IP 各一条。
+        var picks = [];
+        Object.keys(hosts || {}).forEach(function(hwaddr) {
+            var host = hosts[hwaddr] || {};
+            var label = host.name ? (' · ' + host.name) : '';
+            var addrs = L.toArray(host.ipaddrs || host.ipv4 || []);
+            if (!addrs.length) return;
+            picks.push({ group: 1, value: hwaddr, text: hwaddr + label });
+            addrs.forEach(function(addr) {
+                picks.push({ group: 0, value: addr, text: addr + label });
+            });
+        });
+
+        // IP 排在 MAC 前面（group 升序），组内按标签排序；同一地址只保留一条
+        picks.sort(function(a, b) {
+            return (a.group - b.group) || a.text.localeCompare(b.text);
+        });
+        var seenAddr = {};
+        picks.forEach(function(p) {
+            if (seenAddr[p.value]) return;
+            seenAddr[p.value] = true;
+            o.value(p.value, p.text);
+        });
+
+        o = s.option(form.ListValue, 'time_mode', _('Time Control Mode'));
+        o.value('period',   _('Time Period Control (allow in period)'));
+        o.value('duration', _('Allow Duration Control (allow limited time)'));
+        o.value('combined', _('Combined Control (allow in period + limit duration)'));
+        o.default = 'period';
+        o.rmempty = false;
+
+        var validateHHMM = function(section_id, value) {
+            if (value == null || value === '') return true;   // 留空时回退到默认值
+            return /^([01]\d|2[0-3]):[0-5]\d$/.test(value)
+                ? true : _('Invalid time, expected HH:MM (00:00-23:59)');
+        };
+
+        o = s.option(form.Value, 'timestart', _('Allow Start Time'));
+        o.placeholder = '00:00';
+        o.default = '00:00';
+        o.validate = validateHHMM;
+        o.depends('time_mode', 'period');
+        o.depends('time_mode', 'combined');
+
+        o = s.option(form.Value, 'timeend', _('Allow End Time'));
+        o.placeholder = '00:00';
+        o.default = '00:00';
+        o.validate = validateHHMM;
+        o.depends('time_mode', 'period');
+        o.depends('time_mode', 'combined');
+
+        o = s.option(form.Value, 'duration', _('Allowed Duration (minutes)'));
+        o.placeholder = '60';
+        o.default = '60';
+        o.datatype = 'min(1)';
+        o.depends('time_mode', 'duration');
+        o.depends('time_mode', 'combined');
+
+        o = s.option(form.ListValue, 'reset_cycle', _('Reset Cycle'));
+        o.value('daily',   _('Daily Reset'));
+        o.value('weekly',  _('Weekly Reset'));
+        o.value('monthly', _('Monthly Reset'));
+        o.value('never',   _('Never Reset (until manual reset)'));
+        o.default = 'daily';
+        o.depends('time_mode', 'duration');
+        o.depends('time_mode', 'combined');
+
+        o = s.option(form.ListValue, 'week', _('Week Day (1~7)'));
+        o.value('0',         _('Everyday'));
+        o.value('1',         _('Monday'));
+        o.value('2',         _('Tuesday'));
+        o.value('3',         _('Wednesday'));
+        o.value('4',         _('Thursday'));
+        o.value('5',         _('Friday'));
+        o.value('6',         _('Saturday'));
+        o.value('7',         _('Sunday'));
+        o.value('1,2,3,4,5', _('Workday'));
+        o.value('6,7',       _('Rest Day'));
+        o.default = '0';
+        o.rmempty = false;
+
+        // 设备规则表列数多，控件默认宽度会把表撑出横向滚动条。配合各 option 上的
+        // width 百分比，用 table-layout:fixed 强制按百分比分配列宽，并把控件收进
+        // 单元格内（min-width 必须清零，主题 CSS 会给输入框设最小宽度）。
+        var tableCss = `
+            /* 撑满容器；具体列宽由 applyColumnWidths() 写的行内百分比决定。这里不写，
+               因为样式表里的 #id .th:nth-child(n) 会被 Argon 主题盖掉。 */
+            #cbi-netcontrol-device table {
+                table-layout: fixed;
+                width: 100%;
+            }
+            #cbi-netcontrol-device .th,
+            #cbi-netcontrol-device .td {
+                padding: 6px 6px !important;
+                min-width: 0 !important;
+                white-space: normal;
+                word-break: break-word;
+                vertical-align: middle;
+            }
+            /* 控件填满所在单元格。min-width 必须带 !important 清零：主题 CSS 给
+               输入框设了最小宽度，而 LuCI 的 ui.Dropdown 还会按最宽选项算出一个
+               行内 min-width 写死在元素上，不用 !important 压不住，列宽会失效。 */
+            #cbi-netcontrol-device .td input[type="text"],
+            #cbi-netcontrol-device .td select,
+            #cbi-netcontrol-device .td .cbi-dropdown,
+            #cbi-netcontrol-device .td .cbi-dropdown > ul,
+            #cbi-netcontrol-device .td .cbi-dropdown > ul > li {
+                width: 100% !important;
+                min-width: 0 !important;
+                max-width: 100% !important;
+                box-sizing: border-box;
+            }
+            /* 组合框选中项是「MAC: xx (IP - 主机名)」，只需露到 IP，主机名截断即可。
+               li 内层还可能包一层元素，一并处理，否则省略号不生效。 */
+            #cbi-netcontrol-device .td .cbi-dropdown > ul > li,
+            #cbi-netcontrol-device .td .cbi-dropdown > ul > li > * {
+                overflow: hidden;
+                text-overflow: ellipsis;
+                white-space: nowrap;
+            }
+        `;
+
+        // 设备表列宽，顺序即列顺序，合计 100%：
+        // 注释/已启用/IP·MAC/控制方式/开始/结束/时长/重置周期/星期/删除按钮。
+        // 用百分比而非固定像素，表格才能撑满容器；比例按各列实际内容长短分配，
+        // 不平均分——平均分时短内容（09:00、120）会被拉得七零八落。
+        var colWidths = ['13%', '6%', '19%', '16%', '7%', '7%', '7%', '9%', '9%', '7%'];
+
+        // 逐个单元格写行内样式：option.width 被本版 LuCI 忽略，样式表里的
+        // #id .th:nth-child(n) 又会被主题 CSS 盖掉，只有行内样式压得住。
+        // table-layout:fixed 下由首行决定列宽，但所有行都写一遍更保险。
+        function applyColumnWidths(root) {
+            var tbl = root.querySelector('#cbi-netcontrol-device table');
+            if (!tbl) return;
+            var rows = tbl.querySelectorAll('tr');
+            for (var r = 0; r < rows.length; r++) {
+                var cells = rows[r].children;
+                for (var c = 0; c < cells.length && c < colWidths.length; c++)
+                    cells[c].style.setProperty('width', colWidths[c], 'important');
+            }
+        }
+
+        // 服务状态注入到启用复选框行，其余部分组合返回
+        return m.render().then(function(formEl) {
+            // LuCI Flag 渲染结构：.cbi-value-field > input[hidden] + input[checkbox] + label + ...
+            // 将 serviceStatusView 插入到 label（视觉开关）之后
+            var checkbox = formEl.querySelector('input[type="checkbox"]');
+            if (checkbox) {
+                var toggleLabel = checkbox.nextElementSibling;
+                if (toggleLabel && toggleLabel.tagName === 'LABEL') {
+                    toggleLabel.parentNode.insertBefore(serviceStatusView, toggleLabel.nextSibling);
+                } else {
+                    checkbox.parentNode.insertBefore(serviceStatusView, checkbox.nextSibling);
+                }
+            }
+
+            applyColumnWidths(formEl);
+            // 点「添加」「删除」后 LuCI 会重建表格行，行内样式随之丢失，这里补写回去
+            new MutationObserver(function() { applyColumnWidths(formEl); })
+                .observe(formEl, { childList: true, subtree: true });
+
+            return E('div', {}, [E('style', [tableCss]), formEl, deviceStatusSection]);
+        });
+    }
+});

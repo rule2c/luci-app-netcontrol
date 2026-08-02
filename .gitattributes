@@ -1,0 +1,7 @@
+# 工作区内全部文本文件一律使用 LF 行尾。
+#
+# 这些是跑在 OpenWrt 上的 POSIX sh 脚本：一旦带上 CRLF，首行就变成
+# "#!/bin/sh\r"，在路由器上直接报 bad interpreter。而 Git for Windows
+# 默认 core.autocrlf=true，在 Windows 上 clone 会把工作区文件转成 CRLF，
+# 若从该工作区直接 scp 到路由器部署，每个脚本都会挂掉。
+* text=auto eol=lf
