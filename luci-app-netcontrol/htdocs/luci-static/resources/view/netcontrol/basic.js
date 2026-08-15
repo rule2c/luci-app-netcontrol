@@ -91,7 +91,9 @@ function renderStatusTable(content) {
         if (hasDuration) {
             actionEl = E('button', {
                 'class': 'btn cbi-button cbi-button-action',
-                'style': 'font-size:0.85em;padding:2px 8px',
+                // 不缩字号：0.85em 在路由器界面的默认 13px 基础上只剩 11px，
+                // 非整数像素渲染出来发虚。用默认字号，靠 padding 控制按钮体积。
+                'style': 'padding:4px 12px',
                 'click': (function(tgt) {
                     return function(ev) {
                         var btn = ev.currentTarget;
@@ -184,7 +186,8 @@ return view.extend({
         poll.add(refreshStatus, 5);
         poll.start();
 
-        var deviceStatusSection = E('div', { 'class': 'cbi-section' }, [
+        // id 供样式表定位用
+        var deviceStatusSection = E('div', { 'class': 'cbi-section', 'id': 'nc_device_status' }, [
             E('h3', {}, _('Device Status')),
             tableWrap
         ]);
@@ -227,7 +230,13 @@ return view.extend({
         o.rmempty = false;
         o.default = '1';
 
-        o = s.option(form.Value, 'target', _('IP/MAC Address'));
+        // 用 ListValue 而不是带候选值的 Value：本版 LuCI 的 ListValue 渲染成原生
+        // <select>（ui.Select），与「控制方式」「重置周期」「星期」三列同一种控件；
+        // 而带候选值的 Value 会被渲染成 ui.Combobox——那是 div 拼出来的自定义浮层，
+        // 定位、层叠、列宽都得自己兜底，之前的遮挡与列宽跳动全出在它身上。
+        // 代价：原生 select 不能手工输入，新增未探测到的地址（CIDR / IP 范围 / 离线
+        // 设备）要走 uci 命令行。已保存的值会在下面补成候选项，不会丢。
+        o = s.option(form.ListValue, 'target', _('IP/MAC Address'));
         o.rmempty = false;
         // 校验：单个 IPv4 / CIDR / IPv4 范围 / MAC / IPv6(可带前缀)，与后端 parse_target 保持一致
         o.validate = function(section_id, value) {
@@ -284,6 +293,16 @@ return view.extend({
             if (seenAddr[p.value]) return;
             seenAddr[p.value] = true;
             o.value(p.value, p.text);
+        });
+
+        // 已保存但不在候选表里的地址（设备当前离线、或手工配的 CIDR / IP 范围 / IPv6）
+        // 必须补成候选项：原生 select 只能选候选里有的值，缺了这一条已保存的配置会显示
+        // 成空白，用户一点保存就把原来的地址抹掉了。
+        uci.sections('netcontrol', 'device').forEach(function(sec) {
+            var t = (sec.target || '').trim();
+            if (!t || seenAddr[t]) return;
+            seenAddr[t] = true;
+            o.value(t, t);
         });
 
         o = s.option(form.ListValue, 'time_mode', _('Time Control Mode'));
@@ -361,46 +380,70 @@ return view.extend({
                 word-break: break-word;
                 vertical-align: middle;
             }
-            /* 控件填满所在单元格。min-width 必须带 !important 清零：主题 CSS 给
-               输入框设了最小宽度，而 LuCI 的 ui.Dropdown 还会按最宽选项算出一个
-               行内 min-width 写死在元素上，不用 !important 压不住，列宽会失效。 */
+            /* 控件填满所在单元格。min-width 必须带 !important 清零：主题 CSS 会给
+               输入框和 select 设最小宽度，压不掉的话列宽约束就失效了。 */
             #cbi-netcontrol-device .td input[type="text"],
-            #cbi-netcontrol-device .td select,
-            #cbi-netcontrol-device .td .cbi-dropdown,
-            #cbi-netcontrol-device .td .cbi-dropdown > ul,
-            #cbi-netcontrol-device .td .cbi-dropdown > ul > li {
+            #cbi-netcontrol-device .td select {
                 width: 100% !important;
                 min-width: 0 !important;
                 max-width: 100% !important;
                 box-sizing: border-box;
             }
-            /* 组合框选中项是「MAC: xx (IP - 主机名)」，只需露到 IP，主机名截断即可。
-               li 内层还可能包一层元素，一并处理，否则省略号不生效。 */
-            #cbi-netcontrol-device .td .cbi-dropdown > ul > li,
-            #cbi-netcontrol-device .td .cbi-dropdown > ul > li > * {
-                overflow: hidden;
+            /* 选项文字是「地址 · 主机名」，列窄时交给 select 自己截断，不撑破单元格 */
+            #cbi-netcontrol-device .td select {
                 text-overflow: ellipsis;
-                white-space: nowrap;
             }
         `;
 
-        // 设备表列宽，顺序即列顺序，合计 100%：
+        // 设备表列宽，顺序即列顺序：
         // 注释/已启用/IP·MAC/控制方式/开始/结束/时长/重置周期/星期/删除按钮。
         // 用百分比而非固定像素，表格才能撑满容器；比例按各列实际内容长短分配，
         // 不平均分——平均分时短内容（09:00、120）会被拉得七零八落。
-        var colWidths = ['13%', '6%', '19%', '16%', '7%', '7%', '7%', '9%', '9%', '7%'];
+        // 设备表各列占比，顺序即列顺序，合计 100：
+        // 注释/已启用/IP·MAC/控制方式/开始/结束/时长/重置周期/星期/删除按钮。
+        // 比例按各列实际内容长短分配，不平均分——平均分时短内容（09:00、120）会被拉得
+        // 七零八落，而注释、IP/MAC 又不够用。
+        var colPct = [5, 5, 22, 17, 7, 7, 8, 10, 10, 9];
 
+        // 按表格当前实际像素宽度换算成 px 写死，而不是直接写百分比或 em。
+        //
+        // table-layout:fixed 有一条容易忽略的规则：各列指定宽度之和不足表宽时，多出来
+        // 的空间会按比例摊回给每一列。写 '7em' 的注释列就是这样被从 98px 顶到 245px 的
+        // ——指定多少都不作数。换算成 px、并让最后一列吃掉除法余数之后，各列之和恰好
+        // 等于表宽，没有剩余可摊，比例才真正生效。
+        //
+        // 代价是表宽变化后必须重算，故 resize 时要再调用一次（见下方监听）。
         // 逐个单元格写行内样式：option.width 被本版 LuCI 忽略，样式表里的
         // #id .th:nth-child(n) 又会被主题 CSS 盖掉，只有行内样式压得住。
-        // table-layout:fixed 下由首行决定列宽，但所有行都写一遍更保险。
-        function applyColumnWidths(root) {
+        // 实测宽度只在初次渲染和 resize 时取（remeasure=true），其余场合一律复用缓存。
+        // 否则任何一次 DOM 变动都会重新测量，而下拉打开、控件插入这类时刻测到的容器
+        // 宽度可能是短暂失真的（见上方 ul.dropdown 的注释），列宽会莫名其妙跳一下。
+        var cachedWidths = null;
+
+        function applyColumnWidths(root, remeasure) {
             var tbl = root.querySelector('#cbi-netcontrol-device table');
             if (!tbl) return;
+
+            if (remeasure || !cachedWidths) {
+                var total = tbl.clientWidth || tbl.offsetWidth;
+                if (!total) return;
+
+                var list = [], acc = 0, i, w;
+                for (i = 0; i < colPct.length; i++) {
+                    w = (i === colPct.length - 1) ? (total - acc)
+                                                  : Math.floor(total * colPct[i] / 100);
+                    list.push(w + 'px');
+                    acc += w;
+                }
+                cachedWidths = list;
+            }
+
+            var widths = cachedWidths;
             var rows = tbl.querySelectorAll('tr');
             for (var r = 0; r < rows.length; r++) {
                 var cells = rows[r].children;
-                for (var c = 0; c < cells.length && c < colWidths.length; c++)
-                    cells[c].style.setProperty('width', colWidths[c], 'important');
+                for (var c = 0; c < cells.length && c < widths.length; c++)
+                    cells[c].style.setProperty('width', widths[c], 'important');
             }
         }
 
@@ -418,10 +461,17 @@ return view.extend({
                 }
             }
 
-            applyColumnWidths(formEl);
-            // 点「添加」「删除」后 LuCI 会重建表格行，行内样式随之丢失，这里补写回去
-            new MutationObserver(function() { applyColumnWidths(formEl); })
+            applyColumnWidths(formEl, true);
+            // 点「添加」「删除」后 LuCI 会重建表格行，行内样式随之丢失，这里补写回去。
+            // 不重测：此刻的容器宽度未必可信，沿用初次实测的结果即可
+            new MutationObserver(function() { applyColumnWidths(formEl, false); })
                 .observe(formEl, { childList: true, subtree: true });
+
+            // 列宽是按当时的表宽换算成 px 写死的，窗口一变就得重算，否则表格宽度变了
+            // 而列宽还停在旧像素值上
+            window.addEventListener('resize', function() {
+                applyColumnWidths(formEl, true);
+            });
 
             return E('div', {}, [E('style', [tableCss]), formEl, deviceStatusSection]);
         });
