@@ -418,26 +418,32 @@ return view.extend({
         // 实测宽度只在初次渲染和 resize 时取（remeasure=true），其余场合一律复用缓存。
         // 否则任何一次 DOM 变动都会重新测量，而下拉打开、控件插入这类时刻测到的容器
         // 宽度可能是短暂失真的（见上方 ul.dropdown 的注释），列宽会莫名其妙跳一下。
-        var cachedWidths = null;
+        var cachedWidths = null, cachedTotal = 0;
 
         function applyColumnWidths(root, remeasure) {
             var tbl = root.querySelector('#cbi-netcontrol-device table');
             if (!tbl) return;
 
-            if (remeasure || !cachedWidths) {
+            if (remeasure) {
                 var total = tbl.clientWidth || tbl.offsetWidth;
-                if (!total) return;
-
-                var list = [], acc = 0, i, w;
-                for (i = 0; i < colPct.length; i++) {
-                    w = (i === colPct.length - 1) ? (total - acc)
-                                                  : Math.floor(total * colPct[i] / 100);
-                    list.push(w + 'px');
-                    acc += w;
+                // 表格还没插进文档、或尚未排版时量到 0。此时算出来的列宽全是 0，
+                // 直接放弃这一次，等 ResizeObserver 拿到真实宽度再来。
+                // 表宽没变就跳过重算：既省事，也断掉「写列宽 → 触发 ResizeObserver
+                // → 再写列宽」的自激循环。
+                if (total && total !== cachedTotal) {
+                    cachedTotal = total;
+                    var list = [], acc = 0, i, w;
+                    for (i = 0; i < colPct.length; i++) {
+                        w = (i === colPct.length - 1) ? (total - acc)
+                                                      : Math.floor(total * colPct[i] / 100);
+                        list.push(w + 'px');
+                        acc += w;
+                    }
+                    cachedWidths = list;
                 }
-                cachedWidths = list;
             }
 
+            if (!cachedWidths) return;
             var widths = cachedWidths;
             var rows = tbl.querySelectorAll('tr');
             for (var r = 0; r < rows.length; r++) {
@@ -461,17 +467,37 @@ return view.extend({
                 }
             }
 
-            applyColumnWidths(formEl, true);
+            // 列宽必须等表格真正排版之后再量：本函数运行时 formEl 还没插进文档，
+            // clientWidth 是 0，在这里直接调只会白跑一趟——原来正是如此，列宽要等到
+            // 之后某次 DOM 变动才被补上，页面因此会先按默认排版显示、过几秒突然跳一下。
+            // ResizeObserver 在表格拿到尺寸的那一刻回调一次，此后容器每次变宽变窄
+            // （改窗口、折叠侧栏）都会再回调，顺带覆盖了原来的 window.resize 监听。
+            var tbl = formEl.querySelector('#cbi-netcontrol-device table');
+
+            // 首帧兜底：用 rAF 轮询到表格真的有宽度为止（通常一两帧）。不能只靠
+            // ResizeObserver 的首次回调——observe() 一个尚未插入文档的元素时，那次
+            // 初始回调不保证发生，实测就是没发生：页面先按十列均分显示，直到之后
+            // 某次 resize 或 DOM 变动才把列宽补上，视觉上就是过几秒突然跳一下。
+            var tries = 0;
+            (function waitLayout() {
+                var t = formEl.querySelector('#cbi-netcontrol-device table');
+                if (t && (t.clientWidth || t.offsetWidth)) {
+                    applyColumnWidths(formEl, true);
+                    return;
+                }
+                if (++tries < 120) requestAnimationFrame(waitLayout);   // 最多等约 2 秒
+            })();
+
+            // 之后容器变宽变窄（改窗口、折叠侧栏、开关 DevTools）由它兜住
+            if (tbl && window.ResizeObserver)
+                new ResizeObserver(function() { applyColumnWidths(formEl, true); }).observe(tbl);
+            else
+                window.addEventListener('resize', function() { applyColumnWidths(formEl, true); });
+
             // 点「添加」「删除」后 LuCI 会重建表格行，行内样式随之丢失，这里补写回去。
-            // 不重测：此刻的容器宽度未必可信，沿用初次实测的结果即可
+            // 不重测：此刻的容器宽度未必可信，沿用已缓存的结果即可
             new MutationObserver(function() { applyColumnWidths(formEl, false); })
                 .observe(formEl, { childList: true, subtree: true });
-
-            // 列宽是按当时的表宽换算成 px 写死的，窗口一变就得重算，否则表格宽度变了
-            // 而列宽还停在旧像素值上
-            window.addEventListener('resize', function() {
-                applyColumnWidths(formEl, true);
-            });
 
             return E('div', {}, [E('style', [tableCss]), formEl, deviceStatusSection]);
         });
