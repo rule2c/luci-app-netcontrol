@@ -143,10 +143,16 @@ init_dirs() {
     mkdir -p "$DURATION_DIR" "$PERSIST_DIR" /var/lock
     touch "$DURATION_DB" "$CONNECTION_LOG" "$STATUS_FILE" "$IDLIST" "$TARGETLIST" 2>/dev/null
 
-    # 从持久化目录恢复数据
-    if [ -f "$PERSIST_DIR/duration.db" ] && [ -s "$PERSIST_DIR/duration.db" ]; then
+    # 从持久化目录恢复数据。**只在运行时账本不存在或为空时恢复**：那才是真正重启过
+    # 路由器（/var 是 tmpfs，重启必空）。若每次启动都无条件覆盖，仅仅重启一次服务就会
+    # 把账本回滚到上一次持久化的时刻——而持久化只在每 10 轮 / 周期重置 / SIGTERM 时
+    # 发生，且守护进程大半时间阻塞在 sleep，ash 的 trap 要等当前命令结束才执行，procd
+    # 默认 5 秒后就 SIGKILL，退出时那次 sync_persist 基本跑不到。
+    # 回滚不止是丢数据：last_connect 被拉回旧值后，之后第一次 disconnect 会用旧起点算
+    # ts - lc，把回滚窗口里的**离线**时间也一并计入配额（实测多算了 62 秒）。
+    if [ ! -s "$DURATION_DB" ] && [ -s "$PERSIST_DIR/duration.db" ]; then
         cp "$PERSIST_DIR/duration.db" "$DURATION_DB"
-        dbg "已从持久化存储恢复上网时长数据"
+        dbg "运行时账本为空（应为重启后），已从持久化存储恢复上网时长数据"
     fi
     for f in "$PERSIST_DIR"/last_reset_*; do
         [ -f "$f" ] && cp "$f" "$DURATION_DIR/" 2>/dev/null
@@ -291,7 +297,7 @@ target_type() {
     fi
 }
 
-# 邻居表项"距上次被用来发帧"的秒数，取该设备所有表项里最小的；拿不到则输出空。
+# 邻居表项"距上次被用来发帧"的秒数，取该设备所有合格表项里最小的；拿不到则输出空。
 #
 # ip -s neigh 的输出形如：
 #   192.168.1.100 dev br-lan lladdr 00:11:22:33:44:55  used 42/42/40probes 1 STALE
@@ -299,13 +305,28 @@ target_type() {
 # 定位 "used" 这个词再按 "/" 切，不能靠数空格字段。
 # BusyBox 精简版的 ip 不支持 -s，输出里没有 used 字段，此时返回空串，
 # 由 target_online 回落到表项存在性判定。
+#
+# 两类表项必须排除，否则 used 会被路由器自己的管家流量刷新，判定恒为在线：
+#   1. fe80:: 链路本地地址——上面跑的是 RA / NS / DHCPv6 / mDNS，与设备是否上网无关。
+#   2. 带 router 标志的表项（按 MAC 汇总时）——邻居发过 RA 就会被打上该标志，内核
+#      随后对它做周期性可达性探测，探测本身就刷新 used，而设备待机时网口仍活着照样
+#      回应。实测某智能电视因发 RA 导致三个 v6 地址全带 router 标志，遥控关机后
+#      fe80 那条的 used 长期在 100 秒上下打转，把诚实的 IPv4 表项（用了 400 多秒
+#      没动）压了下去，已用时长通宵不停增长。
+#      只在按 MAC 汇总时排除：那时还有 IPv4 表项兜底；直接按某个 IPv6 地址配的目标
+#      要是也排除，就没有任何表项可用了。
 _neigh_idle() {
     local key="$1" bymac="$2"
     ip -s neigh show 2>/dev/null | awk -v k="$key" -v bymac="$bymac" '
+        /(^| )used / { seen = 1 }
         /FAILED|INCOMPLETE/ { next }
+        tolower($1) ~ /^fe80:/ { next }
         {
-            if (bymac == "1") { if (index(tolower($0), k) == 0) next }
-            else              { if ($1 != k) next }
+            if (bymac == "1") {
+                if (index(tolower($0), k) == 0) next
+                for (i = 1; i < NF; i++) if ($i == "router") next
+            }
+            else if ($1 != k) next
             for (i = 1; i < NF; i++)
                 if ($i == "used") {
                     split($(i + 1), a, "/"); v = a[1] + 0
@@ -313,7 +334,10 @@ _neigh_idle() {
                     break
                 }
         }
-        END { if (best != "") print best }'
+        # 有 used 字段说明 ip 支持 -s，此时"一条合格表项都没有"是有意义的结论：
+        # 设备的真实上网地址早已没有流量，判离线。输出远大于阈值的哨兵而不是空串——
+        # 空串会让调用方回落到"表项存在即在线"，那正是本函数要规避的误判。
+        END { if (best != "") print best; else if (seen) print 999999 }'
 }
 
 # 空闲多久算下线。要大于守护进程的最长轮询间隔（60 秒），避免设备只是短暂没流量

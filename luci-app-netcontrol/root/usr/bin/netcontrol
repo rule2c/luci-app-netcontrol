@@ -100,29 +100,59 @@ _split_parsed() {
     esac
 }
 
-# 强控制模式：断开现有连接
+# 删除某个地址进出方向的 conntrack 条目。
+# fam 为空表示 IPv4，IPv6 要显式传 "-f ipv6"；故意不加引号展开成两个参数。
+_conntrack_del() {
+    local fam="$1" addr="$2"
+    $bin_conntrack -D $fam -s "$addr" >/dev/null 2>&1
+    $bin_conntrack -D $fam -d "$addr" >/dev/null 2>&1
+    dbg "已清理 $addr 的 conntrack 条目"
+}
+
+# 查一个 MAC 当前持有的全部地址（IPv4 + IPv6）。
+# 只取第一个 IP 是不够的：双栈设备同时挂着 v4 和 v6，漏掉哪一个，那一边的存量连接
+# 就继续跑。IPv6 侧只能从邻居表取，/proc/net/arp 里没有。
+_ips_of_mac() {
+    local mac="$1"
+    {
+        awk -v m="$mac" 'NR>1 && tolower($4)==m && $3!="0x0"{print $1}' /proc/net/arp 2>/dev/null
+        ip -6 neigh show 2>/dev/null | \
+            awk -v m="$mac" '$0 !~ /FAILED|INCOMPLETE/ && index(tolower($0), "lladdr " m){print $1}'
+    } | sort -u
+}
+
+# 断开目标的现有连接。
+#
+# 必须做，且与控制强度无关：nftables 规则只作用于新建连接，存量连接会一直跑到自然
+# 结束——开着 flow offloading 时更彻底，连接一旦进了 flowtable，后续包在 ingress 就被
+# fastpath 转走，绕过整个 netfilter，连 priority -100 的链也碰不到它。现象是"到点了
+# 正在播的视频不断，新开的网页却打不开"，重启路由器才恢复正常（重启清空了 conntrack
+# 和 flowtable）。删掉 conntrack 条目会连带让对应的 flowtable 条目失效，拦截才即时生效。
 flush_connections() {
     local target="$1"
     [ -x "$bin_conntrack" ] || { dbg "conntrack 不可用，跳过连接清理"; return; }
 
     local parsed; parsed=$(parse_target "$target") || return
     _split_parsed "$parsed"
-    local type="$P_TYPE" value="$P_VALUE"
+    local type="$P_TYPE" value="$P_VALUE" ip
 
     case "$type" in
         ipv4)
-            $bin_conntrack -D -s "$value" 2>/dev/null
-            $bin_conntrack -D -d "$value" 2>/dev/null
-            dbg "已断开 $value 的现有连接"
+            # conntrack 的 -s/-d 认单址和 CIDR，但不认 a-b 这种范围写法
+            case "$value" in *-*) dbg "IP 范围无法按源清理连接，跳过：$value"; return ;; esac
+            _conntrack_del "" "$value"
+            ;;
+        ipv6)
+            case "$value" in */*) dbg "IPv6 前缀无法按源清理连接，跳过：$value"; return ;; esac
+            _conntrack_del "-f ipv6" "$value"
             ;;
         mac)
-            [ -f /proc/net/arp ] || return
-            local ip; ip=$(awk -v m="$value" 'tolower($4)==m{print $1;exit}' /proc/net/arp 2>/dev/null)
-            [ -n "$ip" ] && {
-                $bin_conntrack -D -s "$ip" 2>/dev/null
-                $bin_conntrack -D -d "$ip" 2>/dev/null
-                dbg "已断开 MAC $value 对应 IP $ip 的现有连接"
-            }
+            for ip in $(_ips_of_mac "$value"); do
+                case "$ip" in
+                    *:*) _conntrack_del "-f ipv6" "$ip" ;;
+                    *)   _conntrack_del ""        "$ip" ;;
+                esac
+            done
             ;;
     esac
 }
@@ -208,7 +238,10 @@ add_device() {
         nft add element inet netcontrol "$set" "{ $value }" 2>/dev/null
     fi
 
-    [ "$StrongCHAIN" -eq 1 ] && { dbg "强控制模式：正在断开现有连接"; flush_connections "$target"; }
+    # 先落规则再清连接，顺序不能反：反过来的话，清理与规则生效之间的空窗里设备会立刻
+    # 重建连接，又变成拦不住的存量连接。清理无条件执行，不再挂在强控制模式上（见
+    # flush_connections 的说明）。
+    flush_connections "$target"
     verify_firewall_rule "$target" "$set" "$value"
 }
 
