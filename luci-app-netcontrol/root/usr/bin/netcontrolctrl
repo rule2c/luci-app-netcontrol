@@ -315,9 +315,14 @@ target_type() {
 #      没动）压了下去，已用时长通宵不停增长。
 #      只在按 MAC 汇总时排除：那时还有 IPv4 表项兜底；直接按某个 IPv6 地址配的目标
 #      要是也排除，就没有任何表项可用了。
+# _neigh_idle 在「ip -s 可用、但该设备一条合格表项都没有」时输出的哨兵值：远大于
+# 任何真实空闲秒数，语义是"查不到用网痕迹"。可以据此判离线，但**不能**拿它当真实
+# 空闲时长去回拨记账时刻（见 track_online_state）。
+NEIGH_IDLE_UNKNOWN=999999
+
 _neigh_idle() {
     local key="$1" bymac="$2"
-    ip -s neigh show 2>/dev/null | awk -v k="$key" -v bymac="$bymac" '
+    ip -s neigh show 2>/dev/null | awk -v k="$key" -v bymac="$bymac" -v unknown="$NEIGH_IDLE_UNKNOWN" '
         /(^| )used / { seen = 1 }
         /FAILED|INCOMPLETE/ { next }
         tolower($1) ~ /^fe80:/ { next }
@@ -337,7 +342,7 @@ _neigh_idle() {
         # 有 used 字段说明 ip 支持 -s，此时"一条合格表项都没有"是有意义的结论：
         # 设备的真实上网地址早已没有流量，判离线。输出远大于阈值的哨兵而不是空串——
         # 空串会让调用方回落到"表项存在即在线"，那正是本函数要规避的误判。
-        END { if (best != "") print best; else if (seen) print 999999 }'
+        END { if (best != "") print best; else if (seen) print unknown }'
 }
 
 # 空闲多久算下线。要大于守护进程的最长轮询间隔（60 秒），避免设备只是短暂没流量
@@ -357,27 +362,32 @@ ONLINE_IDLE_MAX=300
 #
 # 拿不到 used 时回落到表项存在性或 conntrack 判定。
 # CIDR / IP 范围无法逐主机判定，一律视为在线。
+# target_online 把本次测到的空闲秒数留在这里，供 track_online_state 回拨记账时刻。
+# 走回落判定（BusyBox 的 ip 不支持 -s）或目标是网段/范围时置空，表示无从得知。
+ONLINE_IDLE=''
+
 target_online() {
     local target="$1" lc idle
+    ONLINE_IDLE=''
     case "$(target_type "$target")" in
         mac)
             lc="$(printf '%s' "$target" | tr 'A-Z' 'a-z')"
             idle="$(_neigh_idle "$lc" 1)"
-            [ -n "$idle" ] && { [ "$idle" -le "$ONLINE_IDLE_MAX" ]; return $?; }
+            [ -n "$idle" ] && { ONLINE_IDLE="$idle"; [ "$idle" -le "$ONLINE_IDLE_MAX" ]; return $?; }
             awk -v m="$lc" 'NR>1 && tolower($4)==m && $3!="0x0"{f=1} END{exit(f?0:1)}' /proc/net/arp 2>/dev/null && return 0
             ip neigh show 2>/dev/null | grep -Fi "lladdr $lc" | grep -qv FAILED
             ;;
         ipv6)
             case "$target" in */*) return 0 ;; esac
             idle="$(_neigh_idle "$target" 0)"
-            [ -n "$idle" ] && { [ "$idle" -le "$ONLINE_IDLE_MAX" ]; return $?; }
+            [ -n "$idle" ] && { ONLINE_IDLE="$idle"; [ "$idle" -le "$ONLINE_IDLE_MAX" ]; return $?; }
             ip -6 neigh show 2>/dev/null | awk -v t="$target" '$1==t && $0!~/FAILED/{f=1} END{exit(f?0:1)}' && return 0
             grep -qF "src=$target " /proc/net/nf_conntrack 2>/dev/null
             ;;
         *)
             case "$target" in */*|*-*) return 0 ;; esac
             idle="$(_neigh_idle "$target" 0)"
-            [ -n "$idle" ] && { [ "$idle" -le "$ONLINE_IDLE_MAX" ]; return $?; }
+            [ -n "$idle" ] && { ONLINE_IDLE="$idle"; [ "$idle" -le "$ONLINE_IDLE_MAX" ]; return $?; }
             awk -v t="$target" 'NR>1 && $1==t && $3!="0x0"{f=1} END{exit(f?0:1)}' /proc/net/arp 2>/dev/null && return 0
             grep -qF "src=$target " /proc/net/nf_conntrack 2>/dev/null
             ;;
@@ -399,8 +409,20 @@ track_online_state() {
         }
     else
         [ "$last" = "connect" ] && {
-            record_connection_time "$target" "disconnect"
-            info "$target 已离线，暂停累计上网时长"
+            # 判离线的条件是"空闲已超过 ONLINE_IDLE_MAX"，所以走到这里时，设备距最后
+            # 一次真正用网已经过去 ONLINE_IDLE 秒。按当前时刻记 disconnect 会把这段纯
+            # 空闲算进配额——实测待机电视一次 77 秒的遥测心跳被记成 428 秒，八成是空的。
+            # 迟滞窗口是为了防抖动（设备短暂停顿不该被判离线），不该同时充当计时；
+            # 因此把记账时刻回拨到最后一次用网的时刻。
+            # 拿不到空闲秒数（BusyBox 回落判定）或拿到的是哨兵值（表项已消失，无从
+            # 得知真实时刻）时，按迟滞窗口本身回拨，不做更激进的猜测。
+            local now back
+            now="$(date +%s)"
+            back="$ONLINE_IDLE"
+            case "$back" in ''|*[!0-9]*) back="$ONLINE_IDLE_MAX" ;; esac
+            [ "$back" -ge "$NEIGH_IDLE_UNKNOWN" ] && back="$ONLINE_IDLE_MAX"
+            record_connection_time "$target" "disconnect" "$((now - back))"
+            info "$target 已离线，暂停累计上网时长（回拨 ${back} 秒空闲时间）"
         }
     fi
 }
@@ -464,10 +486,12 @@ is_weekday_in_range() {
 
 # ─── 时长管理 ─────────────────────────────────────────────────────────────────
 
+# 第三个参数可指定记账时刻（默认取当前时间）：判离线时要回拨到设备最后一次真正
+# 用网的时刻，见 track_online_state。
 record_connection_time() {
-    local target="$1" action="$2"
+    local target="$1" action="$2" ts_override="$3"
     local ts tmp
-    ts="$(date +%s)"
+    ts="${ts_override:-$(date +%s)}"
     tmp="$DURATION_DB.$$"
 
     # 两个分支各用一次 awk 就地改写整个 db，避免在锁里反复 fork。记录改写在原位而非
@@ -491,11 +515,13 @@ record_connection_time() {
         {
             flock 9 2>/dev/null
             # 目标不在 db 里时不补写：没有起算点就无从计算这段时长
+            # 增量允许为负：ts 被回拨后，若这段空闲期里 checkpoint 已经把时间落进
+            # total，就要在这里扣回来，否则回拨白做。总数夹在 0 以上兜住异常。
             awk -F, -v OFS=, -v t="$target" -v ts="$ts" '
                 $1 == t {
                     lc = ($2 == "" ? ts : $2); tc = ($3 == "" ? 0 : $3); lr = ($4 == "" ? 0 : $4)
-                    sd = ts - lc; if (sd < 0) sd = 0
-                    print t, ts, tc + sd, lr; next
+                    tot = tc + (ts - lc); if (tot < 0) tot = 0
+                    print t, ts, tot, lr; next
                 }
                 { print }
             ' "$DURATION_DB" > "$tmp" 2>/dev/null && mv "$tmp" "$DURATION_DB"
