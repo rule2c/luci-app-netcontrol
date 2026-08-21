@@ -160,7 +160,11 @@ flush_connections() {
 # 生成 nftables 规则文本（函数输出，供 nft -f - 读取）
 # 开头的 “空表占位 + 删除 + 重建” 惯用法让整段在单次 nft -f 内原子完成：
 # 既保证待删的表一定存在（避免删除不存在的表使整段失败），又消除规则空窗期。
+#
+# 参数 $1 = nopre 时不生成 prerouting 链，退回只挂 forward/input 的老形态，
+# 供 init_firewall 在内核缺少 fib 表达式时降级使用。
 _nft_script() {
+    local mode="$1"
     cat << 'NFT'
 table inet netcontrol {}
 delete table inet netcontrol
@@ -176,6 +180,26 @@ table inet netcontrol {
     set blacklist_mac {
         type ether_addr
     }
+NFT
+    # 主拦截点挂在 prerouting，且优先级必须早于一切透明代理。passwall / OpenClash 这类
+    # 代理在 prerouting 的 mangle(-150) 做 TPROXY、在 nat 的 dstnat(-100) 做 REDIRECT，
+    # 两种都让包在路由判决时被送去 input 交给本机代理进程代为出网，**根本不经过 forward**。
+    # 只挂 forward 时集合、规则、日志全都正常，匹配次数却是 0（踩过，见 DEVELOPMENT.md）。
+    # -350 早于 fw4 的 raw_prerouting(-300)、conntrack(-200) 和上面两个代理落点。
+    if [ "$mode" != "nopre" ]; then
+        printf '    chain prerouting {\n'
+        printf '        type filter hook prerouting priority -350; policy accept;\n'
+        # 温和模式放行发往路由器自身的流量：DNS、DHCP、LuCI、ARP/ND 都得留着，否则设备
+        # 直接掉出局域网，守护进程赖以判在线的邻居表也跟着失准。这里目的地址还是原始的
+        # 公网地址（TPROXY/REDIRECT 都尚未改写），所以出网流量不会被这一条放掉。
+        [ "$StrongCHAIN" -eq 1 ] || \
+            printf '        fib daddr type { local, broadcast, multicast } accept\n'
+        printf '        ip saddr @blacklist drop\n'
+        printf '        ip6 saddr @blacklist6 drop\n'
+        printf '        ether saddr @blacklist_mac drop\n'
+        printf '    }\n'
+    fi
+    cat << 'NFT'
     chain forward {
         type filter hook forward priority -100; policy accept;
         ip saddr @blacklist drop
@@ -201,6 +225,12 @@ init_firewall() {
     if _nft_script | nft -f -; then
         [ "$StrongCHAIN" -eq 1 ] && dbg "强控制模式已启用，INPUT 链同步拦截"
         info "nftables 规则加载成功"
+        return 0
+    fi
+    # 整段加载失败，最可能是内核没有 nft_fib_inet（prerouting 链里的 fib 表达式）。
+    # 降级成只挂 forward/input 的老形态，至少保住无代理环境下的拦截能力，并把风险写进日志。
+    if _nft_script nopre | nft -f -; then
+        info "内核不支持 fib 表达式，已降级为仅 forward/input 拦截；透明代理（passwall 等）环境下可能拦不住"
         return 0
     fi
     info "nftables 规则加载失败，请检查 nftables 版本"
