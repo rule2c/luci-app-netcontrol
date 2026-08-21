@@ -19,6 +19,8 @@ OpenWrt 上网管控插件，基于 nftables 限制局域网设备的上网时�
 - 已用时长定期落盘至 `/etc/netcontrol/`，重启路由器不会清零。
 - 可选强控制模式：同时拦截发往路由器自身的流量（被拦设备连 LuCI 界面也进不去）。
 - 界面提供实时状态表，可单独重置某台设备的已用时长。
+- 可识别并拦截使用随机 MAC 的设备：手机、电脑每次联网换一个 MAC 会让按 MAC 配的规则失效，
+  开启后这类设备一律禁止上网，另设放行名单。
 
 ## 依赖
 
@@ -54,9 +56,13 @@ netcontrol test           # 地址解析自测
 netcontrol-log realtime   # 实时日志（彩色高亮）
 ```
 
-## 开发
+## 构建
 
-架构说明、构建方式与维护陷阱见 [DEVELOPMENT.md](DEVELOPMENT.md)。
+```bash
+make package/feeds/netcontrol/luci-app-netcontrol/compile V=s
+```
+
+shell 脚本的目标环境是 BusyBox ash，改动后用 `sh -n` 检查语法，不要使用 bash 特有语法。
 
 ## 许可证
 
