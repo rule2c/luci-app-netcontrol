@@ -398,6 +398,11 @@ _acct_match() {
     esac
 }
 
+# 上一次尝试过的目标组。防的是这种空转：某个地址 nft 死活不认（手工 uci set 打错字
+# 最容易撞上），have 永远追不上 want，于是每轮都 flush 重来一次，把所有设备的计数器
+# 反复清零——受害的不是那一台，是全部。
+ACCT_WANT=""
+
 # 让 accounting 链里的规则集合与当前需要计时的目标一致。
 # 集合有出入就整链重建，不做增量增删：省掉解析 handle 的一堆麻烦，代价只是计数器
 # 归零，而归零下一 tick 会被识别成“没有基线”跳过一轮，不会误记。
@@ -409,13 +414,28 @@ sync_accounting_rules() {
         sed -n 's/.*comment "t=\([^"]*\)".*/\1/p' | sort -u)"
     want="$(printf '%s\n' "$list" | sed '/^$/d' | sort -u)"
     [ "$have" = "$want" ] && return 0
-    {
-        printf 'flush chain inet netcontrol accounting\n'
-        printf '%s\n' "$want" | while IFS= read -r t; do
-            [ -n "$t" ] && printf 'add rule inet netcontrol accounting %s counter comment "t=%s"\n' \
-                "$(_acct_match "$t")" "$t"
-        done
-    } | nft -f - 2>/dev/null
+    # 目标组跟上次试过的一样、链里又不是空的：差异来自加不进去的地址，别再重来一遍。
+    # 链空则一律重建——那是表被重新装载过，必须补。
+    [ "$want" = "$ACCT_WANT" ] && [ -n "$have" ] && return 0
+    ACCT_WANT="$want"
+
+    nft flush chain inet netcontrol accounting 2>/dev/null
+    # 被拦截的设备不计时：配额本就用尽（或不在允许时段），不该被“拦下后仍在重试的
+    # 连接”继续消耗。放在链首用 return 显式跳过，而不是依赖 -349 排在拦截链 -350
+    # 之后——降级形态（_nft_script nopre）里拦截落在 forward，根本排不到 prerouting
+    # 前面，光靠优先级次序在那种形态下是不成立的。
+    for t in 'ip saddr @blacklist' 'ip6 saddr @blacklist6' 'ether saddr @blacklist_mac'; do
+        printf 'add rule inet netcontrol accounting %s return\n' "$t" | nft -f - 2>/dev/null
+    done
+    # 逐条 add，不用一次 nft -f 批量提交：批量是原子的，队列里只要有一个地址 nft 不认，
+    # 整笔事务回滚，**所有**设备的计数规则一条都建不起来，而日志里什么都看不出来。
+    # 逐条加则只有坏的那条落不下，而且能点名。
+    printf '%s\n' "$want" | while IFS= read -r t; do
+        [ -n "$t" ] || continue
+        printf 'add rule inet netcontrol accounting %s counter comment "t=%s"\n' \
+            "$(_acct_match "$t")" "$t" | nft -f - 2>/dev/null || \
+            info "地址 $t 无法建立计时规则，这台设备不会计入上网时长"
+    done
     dbg "已重建流量计数规则"
 }
 
