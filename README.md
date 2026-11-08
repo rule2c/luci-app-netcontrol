@@ -19,6 +19,9 @@ OpenWrt 上网管控插件，基于 nftables 限制局域网设备的上网时�
 - 已用时长定期落盘至 `/etc/netcontrol/`，重启路由器不会清零。
 - 可选强控制模式：同时拦截发往路由器自身的流量（被拦设备连 LuCI 界面也进不去）。
 - 界面提供实时状态表，可单独重置某台设备的已用时长。
+- 支持中国法定节假日：规则的星期可选“法定工作日（含调休补班）”或“法定节假日及周末（不含补班）”。
+  内置 2025–2027 年数据（来自 [holiday-cn](https://github.com/NateScarlet/holiday-cn)），有规则用到时每天联网
+  更新一次；也可在“自定义日期”里按天覆盖（如 `2026-12-31:off`）。某年没有数据时按周一至周五为工作日处理。
 - 可识别并拦截使用随机 MAC 的设备：手机、电脑每次联网换一个 MAC 会让按 MAC 配的规则失效，
   开启后这类设备一律禁止上网，另设放行名单。
 
@@ -53,6 +56,8 @@ echo 'src-git netcontrol https://github.com/rule2c/luci-app-netcontrol.git' >> f
 netcontrol diagnose       # 系统诊断
 netcontrol status         # 查看当前 nftables 规则
 netcontrol test           # 地址解析自测
+netcontrol holiday-info   # 今天的法定日类型与已有数据年份
+netcontrol holiday-update # 立即在线更新节假日数据
 netcontrol-log realtime   # 实时日志（彩色高亮）
 ```
 
